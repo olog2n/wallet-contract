@@ -2,25 +2,39 @@
 ;; Simple subscription plugin for wallet-v4
 ;; anyone can ask to send a subscription payment
 
-(int) slice_data_equal?(slice s1, slice s2) asm "SDEQ";
+;; Интересная запись условного модификатора или inline функции
+;; Фактически здесь просто сравнивание двух срезов, что можно интерпретировать как побитовое сравнение случайных данных
+(int) slice_data_equal?(slice s1, slice s2) asm "SDEQ"; 
 
+;;Здесь идет определение набора "команд" которые может обрабатывать контракт
+;;Команды взяты в ковычки, так как это псевдонабор команд и наиболее точно можно определить это дело как интерфейсы в солидити
+;;Тонкость данных команд заключается в том, что следует избегать пересечений кодов с уже принятыми в ТВМ и в других стандартах, либо наоборот использовать их
+;;В данном конкретном случае определяется команда на самоликвидацию
 int op:destruct() asm "0x64737472 PUSHINT";
+;;В данном случае рассматривается запрос на открытие платежа, т.е кошелек отправил его(вопрос какой? отправителя или получателя?)
 int op:payment_request() asm "0x706c7567 PUSHINT";
+;;Пока не понятно что именно за fallback
 int op:fallback() asm "0x756e6b77 PUSHINT";
+;;Пока не понятно что это за саб такой
 int op:subscription() asm "0x73756273 PUSHINT";
+
+;;Здесь описываются кастомные ошибки как в солидити
 int max_failed_attempts() asm "2 PUSHINT";
 int max_reserved_funds() asm "67108864 PUSHINT"; ;; 0.0671 TON
 
+;;здесь вроде бы самостоятельная функция, но кажется я ее уже видел в стандартной библиотеке
+;;Вопросы возникают относительно config_param, в документации указано что это глобальный параметр, но за что он отвечает - неизвестно
 int short_msg_fwd_fee(int workchain) inline {
   int config_index = 25 + workchain;
+;; Насколько я понимаю здесь на самом деле вытаскивается цена за которою сообщение может быть переправлено, в силу того что у нас асинхронщина и надо хитро платить за сообщения
   int lump_price = config_param(config_index).begin_parse().skip_bits(8).preload_uint(64);
   return lump_price;
 }
-
+;; ну относительно папайи здесь как раз усеченный расчет стоимости происходит
 int gas_to_coins(int workchain, int gas) inline_ref {
   int config_index = 21 + workchain;
   var cs = config_param(config_index).begin_parse();
-  if (cs.preload_uint(8) == 0xd1) { ;; gas_flat_pfx
+  if (cs.preload_uint(8) == 0xd1) { ;; gas_flat_pfx ;; Насколько я понимаю здесь рассматривается ситуация когда данные проставлены, в силу того что конфиги поставляются в бинарном виде, где смешались флаги, люди и кони
     cs~skip_bits(8 + 64 + 64);
   }
   int tag = cs~load_uint(8);
@@ -29,6 +43,7 @@ int gas_to_coins(int workchain, int gas) inline_ref {
   return (gas * gas_price) >> 16;
 }
 
+;; Здесь описание c4 регистра
 ;; storage$_ wallet:MsgAddressInt
 ;;           beneficiary:MsgAddressInt
 ;;           amount:Grams
@@ -61,23 +76,24 @@ int gas_to_coins(int workchain, int gas) inline_ref {
     .store_uint(subscription_id, 32) ;; to differ subscriptions to the same beneficiary (acts as a nonce)
   .end_cell());
 }
-
+;; Здесь происходит отправка средств по запросу
 () forward_funds(slice beneficiary, int self_destruct?, int op) impure inline_ref {
   if ~(self_destruct?) {
     raw_reserve(max_reserved_funds(), 2); ;; reserve at most `max_reserved_funds` nanocoins
   }
-  var msg = begin_cell()
+  var msg = begin_cell() ;; здесь происходит создание сообщения, его действительно надо руками обернуть в ячейку и затем отправить ее же
       .store_uint(0x10, 6) ;; non-bounce message
       .store_slice(beneficiary)
       .store_grams(0)
       .store_dict(pair_second(get_balance()))
-      .store_uint(0, 4 + 4 + 64 + 32 + 1 + 1)
+      .store_uint(0, 4 + 4 + 64 + 32 + 1 + 1) ;; пока что не разобрался как именно сюда закидывать данные
       .store_uint(op, 32);
   int mode = 128; ;; carry all the remaining balance of the current smart contract
   if (self_destruct?) {
     mode += 32; ;; must be destroyed if its resulting balance is zero
   }
-  send_raw_message(msg.end_cell(), mode);
+  send_raw_message(msg.end_cell(), mode); ;; Метод из стандартной библиотеки, он вытащит адрес beneficiary и отправит ему эти данные, параметры mode можно уточнить в документации
+  ;; попадает все это дело в метод recv_internal, там уже идет обработка
 }
 
 () request_payment(slice wallet, int requested_amount) impure inline_ref {
@@ -114,6 +130,9 @@ int gas_to_coins(int workchain, int gas) inline_ref {
 }
 
 () recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+;; здесь получается контекст, с которым необходимо работать
+;; суть в том, что у каждого кошелька именно этот смарт будет свой
+;; это также означает что у каждой пары подписчик - автор также будет отдельный смарт-контракт, в силу того что контекст может определять только одного конкретного пользователя
   var (wallet, beneficiary, amount, period, start_time, timeout, last_payment_time, last_request_time, failed_attempts, subscription_id) = load_storage();
   var cs = in_msg_cell.begin_parse();
   var flags = cs~load_uint(4);
@@ -135,10 +154,10 @@ int gas_to_coins(int workchain, int gas) inline_ref {
   }
   int op = in_msg~load_uint(32);
 
-  if (op == (op:payment_request() | 0x80000000)) {
+  if (op == (op:payment_request() | 0x80000000)) { ;; несколько не понятно зачем здесь побитовое "или"
     int last_timeslot = (last_payment_time - start_time) / period;
     int cur_timeslot = (now() - start_time) / period;
-    throw_if(49, last_timeslot >= cur_timeslot);
+    throw_if(49, last_timeslot >= cur_timeslot); ;; Вот могли бы завезти в язык нормальные ошибки, а не коды ошибок, без шуток, ведь это так приятно работать только с числами
     (int from_wc, _) = s_addr.parse_std_addr();
 
     if (msg_value >= amount - short_msg_fwd_fee(from_wc) ) {
@@ -177,3 +196,5 @@ int gas_to_coins(int workchain, int gas) inline_ref {
   return (pair(parse_std_addr(wallet)), pair(parse_std_addr(beneficiary)),
           amount, period, start_time, timeout, last_payment_time, last_request_time, failed_attempts, subscription_id);
 }
+
+;; В довершении в чем проблема этого смарта и в чем он хорош, в принципе он решает проблемы также как и мы, но! он работает только с тоном, а не с произвольными активами, поэтому наиболее целесообразно будет модификация данного кода
